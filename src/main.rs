@@ -1,3 +1,4 @@
+use dotenv::dotenv;
 use tokio;
 use tokio_postgres::{NoTls, Transaction, Error, Client};
 use serde::{Deserialize, Serialize};
@@ -6,6 +7,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tokio_postgres::CopyInSink;
 use futures::sink::SinkExt;
+use std::time::Instant;
+use std::env;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Block {
@@ -19,16 +22,15 @@ struct Block {
     version: i32,
     bits: String,
     previousblockhash: Option<String>,
-    tx: Vec<String>,
+    tx: Vec<Tx>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Tx {
     txid: String,
-    blockhash: String,
     size: i32,
     version: i32,
-    locktime: i32,
+    locktime: i64,
     vin: Vec<Vin>,
     vout: Vec<Vout>,
 }
@@ -58,14 +60,20 @@ struct ScriptPubKey {
     asm: String,
 }
 
-const RPC_USER: &str = "michaelycrypto";
-const RPC_PASSWORD: &str = "123456";
-const RPC_PORT: u16 = 8332;
-const PG_CONNECTION_STRING: &str = "host=localhost user=postgres password=postgres dbname=postgres";
-
 #[tokio::main]
 async fn main() {
-    let (mut client, connection) = tokio_postgres::connect(PG_CONNECTION_STRING, NoTls).await.unwrap();
+    dotenv().ok();
+
+    let rpc_user = env::var("RPC_USER").expect("RPC_USER must be set");
+    let rpc_password = env::var("RPC_PASSWORD").expect("RPC_PASSWORD must be set");
+    let rpc_host = env::var("RPC_HOST").expect("RPC_HOST must be set");
+    let rpc_port: u16 = env::var("RPC_PORT")
+        .expect("RPC_PORT must be set")
+        .parse()
+        .expect("RPC_PORT must be a number");
+    let pg_connection_string = env::var("PG_CONNECTION_STRING").expect("PG_CONNECTION_STRING must be set");
+
+    let (mut client, connection) = tokio_postgres::connect(&pg_connection_string, NoTls).await.unwrap();
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("Connection error: {}", e);
@@ -77,12 +85,12 @@ async fn main() {
         return;
     }
 
-    match fetch_best_block_hash().await {
+    match fetch_best_block_hash(&rpc_host, &rpc_user, &rpc_password, rpc_port).await {
         Ok(latest_block_hash) => {
-            if let Err(e) = sync_blockchain(&mut client, &latest_block_hash).await {
+            if let Err(e) = sync_blockchain(&mut client, &latest_block_hash, &rpc_host, &rpc_user, &rpc_password, rpc_port).await {
                 eprintln!("Failed to sync blockchain: {}", e);
             }
-            if let Err(e) = keep_up_to_date(&mut client).await {
+            if let Err(e) = keep_up_to_date(&mut client, &rpc_host, &rpc_user, &rpc_password, rpc_port).await {
                 eprintln!("Failed to keep up to date: {}", e);
             }
         },
@@ -117,7 +125,7 @@ async fn setup_database(client: &Client) -> Result<(), Error> {
             block_hash VARCHAR(64) REFERENCES blocks(block_hash),
             size INT,
             version INT,
-            locktime INT
+            locktime BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS inputs (
@@ -133,7 +141,7 @@ async fn setup_database(client: &Client) -> Result<(), Error> {
         CREATE TABLE IF NOT EXISTS outputs (
             txid VARCHAR(64) REFERENCES transactions(txid),
             output_index INT,
-            value BIGINT,
+            value NUMERIC(20, 8),
             script_pub_key TEXT,
             PRIMARY KEY (txid, output_index)
         );
@@ -143,12 +151,12 @@ async fn setup_database(client: &Client) -> Result<(), Error> {
     })
 }
 
-async fn fetch_best_block_hash() -> Result<String, reqwest::Error> {
-    let url = format!("http://207.180.219.123:{}/", RPC_PORT);
+async fn fetch_best_block_hash(rpc_host: &str, rpc_user: &str, rpc_password: &str, rpc_port: u16) -> Result<String, reqwest::Error> {
+    let url = format!("http://{}:{}/", rpc_host, rpc_port);
     let client = HttpClient::new();
     let response = client
         .post(&url)
-        .basic_auth(RPC_USER, Some(RPC_PASSWORD))
+        .basic_auth(rpc_user, Some(rpc_password))
         .json(&serde_json::json!({
             "jsonrpc": "1.0",
             "id": "curltest",
@@ -163,114 +171,68 @@ async fn fetch_best_block_hash() -> Result<String, reqwest::Error> {
     Ok(response["result"].as_str().unwrap().to_string())
 }
 
-async fn fetch_block(block_hash: &str) -> Result<Block, reqwest::Error> {
-    let url = format!("http://207.180.219.123:{}/", RPC_PORT);
+async fn fetch_block(block_hash: &str, rpc_host: &str, rpc_user: &str, rpc_password: &str, rpc_port: u16) -> Result<Block, reqwest::Error> {
+    let url = format!("http://{}:{}/", rpc_host, rpc_port);
     let client = HttpClient::new();
     let response = client
         .post(&url)
-        .basic_auth(RPC_USER, Some(RPC_PASSWORD))
+        .basic_auth(rpc_user, Some(rpc_password))
         .json(&serde_json::json!({
             "jsonrpc": "1.0",
             "id": "curltest",
             "method": "getblock",
-            "params": [block_hash]
+            "params": [block_hash, 2] // Using verbosity 2 to get full transaction data
         }))
         .send()
         .await?
         .json::<serde_json::Value>()
         .await?;
 
-    // Print the response
-    // println!("{}", response["result"]);
+    Ok(serde_json::from_value(response["result"].clone()).unwrap())
+}
+
+async fn process_block(client: &mut Client, block: &Block) -> Result<(), Box<dyn std::error::Error>> {
+    store_block(client, block, false).await?;
     
-    Ok(serde_json::from_value(response["result"].clone()).unwrap())
+    let mut transactions = Vec::new();
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+
+    for tx in &block.tx {
+        transactions.push(tx.clone());
+        for (index, vin) in tx.vin.iter().enumerate() {
+            inputs.push((tx.txid.clone(), index as i32, vin.txid.clone(), vin.vout, vin.scriptSig.as_ref().map(|s| s.asm.clone()), vin.sequence));
+        }
+        for (index, vout) in tx.vout.iter().enumerate() {
+            outputs.push((tx.txid.clone(), index as i32, vout.value, vout.scriptPubKey.asm.clone()));
+        }
+    }
+
+    let transaction = client.transaction().await?;
+    store_transactions(&transaction, &transactions, &block.hash).await?;
+    store_inputs(&transaction, &inputs).await?;
+    store_outputs(&transaction, &outputs).await?;
+    transaction.commit().await?;
+
+    Ok(())
 }
 
-async fn fetch_transaction(txid: &str) -> Result<Tx, reqwest::Error> {
-    let url = format!("http://207.180.219.123:{}/", RPC_PORT);
-    let client = HttpClient::new();
-    let response = client
-        .post(&url)
-        .basic_auth(RPC_USER, Some(RPC_PASSWORD))
-        .json(&serde_json::json!({
-            "jsonrpc": "1.0",
-            "id": "curltest",
-            "method": "getrawtransaction",
-            "params": [txid, 1]
-        }))
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
-
-    Ok(serde_json::from_value(response["result"].clone()).unwrap())
-}
-
-async fn sync_blockchain(client: &mut Client, latest_block_hash: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn sync_blockchain(client: &mut Client, latest_block_hash: &str, rpc_host: &str, rpc_user: &str, rpc_password: &str, rpc_port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let mut block_hash = latest_block_hash.to_string();
 
     while !block_hash.is_empty() {
-        println!("Fetching block {}", block_hash);
-        let block = fetch_block(&block_hash).await.map_err(|e| {
-            eprintln!("Failed to fetch block {}: {}", block_hash, e);
-            e
-        })?;
+        // println!("Processing block {}", block_hash);
+        let block = fetch_block(&block_hash, rpc_host, rpc_user, rpc_password, rpc_port).await?;
 
-        println!("Storing block {}", block.hash);
-        store_block(client, &block, true).await.map_err(|e| {
-            eprintln!("Failed to store block {}: {}", block.hash, e);
-            e
-        })?;
-        
-        let mut transactions = Vec::new();
-        // let mut inputs = Vec::new();
-        // let mut outputs = Vec::new();
-
-        println!("Indexing transactions for block {}", block.hash);
-
-        for txid in &block.tx {
-            let tx = fetch_transaction(txid).await.map_err(|e| {
-                eprintln!("Failed to fetch transaction {}: {}", txid, e);
-                e
-            })?;
-            transactions.push(tx.clone());
-            // for (index, vin) in tx.vin.iter().enumerate() {
-            //     inputs.push((tx.txid.clone(), index as i32, vin.txid.clone(), vin.vout, vin.scriptSig.as_ref().map(|s| s.asm.clone()), vin.sequence));
-            // }
-            // for (index, vout) in tx.vout.iter().enumerate() {
-            //     outputs.push((tx.txid.clone(), index as i32, vout.value, vout.scriptPubKey.asm.clone()));
-            // }
-        }
-
-        println!("Storing transactions for block {}", block.hash);
-
-        let transaction = client.transaction().await.map_err(|e| {
-            eprintln!("Failed to start transaction for block {}: {}", block.hash, e);
-            e
-        })?;
-        store_transactions(&transaction, &transactions).await.map_err(|e| {
-            eprintln!("Failed to store transactions for block {}: {}", block.hash, e);
-            e
-        })?;
-        // store_inputs(&transaction, &inputs).await.map_err(|e| {
-        //     eprintln!("Failed to store inputs for block {}: {}", block.hash, e);
-        //     e
-        // })?;
-        // store_outputs(&transaction, &outputs).await.map_err(|e| {
-        //     eprintln!("Failed to store outputs for block {}: {}", block.hash, e);
-        //     e
-        // })?;
-        transaction.commit().await.map_err(|e| {
-            eprintln!("Failed to commit transaction for block {}: {}", block.hash, e);
-            e
-        })?;
+        let start = Instant::now();
+        process_block(client, &block).await?;
+        let duration = start.elapsed();
+        println!("Block processed ({:?}) {}", duration, block_hash);
 
         block_hash = match block.previousblockhash {
             Some(hash) => hash,
             None => "".to_string(),
         };
-
-        println!("Finished processing block {}", block.hash);
     }
 
     Ok(())
@@ -298,11 +260,11 @@ async fn store_block(client: &Client, block: &Block, active: bool) -> Result<u64
     })
 }
 
-async fn store_transactions(transaction: &Transaction<'_>, transactions: &[Tx]) -> Result<(), Error> {
+async fn store_transactions(transaction: &Transaction<'_>, transactions: &[Tx], block_hash: &str) -> Result<(), Error> {
     let sink: CopyInSink<bytes::Bytes> = transaction.copy_in("COPY transactions (txid, block_hash, size, version, locktime) FROM STDIN WITH DELIMITER ',' CSV").await?;
     let mut sink = Box::pin(sink);
     for tx in transactions {
-        let line = format!("{},{},{},{},{}\n", tx.txid, tx.blockhash, tx.size, tx.version, tx.locktime);
+        let line = format!("{},{},{},{},{}\n", tx.txid, block_hash, tx.size, tx.version, tx.locktime);
         sink.send(line.into()).await.map_err(|e| {
             eprintln!("Error sending transaction {}: {}", tx.txid, e);
             e
@@ -346,99 +308,38 @@ async fn store_outputs(transaction: &Transaction<'_>, outputs: &[(String, i32, f
     })
 }
 
-async fn keep_up_to_date(client: &mut Client) -> Result<(), Box<dyn std::error::Error>> {
+async fn keep_up_to_date(client: &mut Client, rpc_host: &str, rpc_user: &str, rpc_password: &str, rpc_port: u16) -> Result<(), Box<dyn std::error::Error>> {
     loop {
-        let latest_block_hash = fetch_best_block_hash().await.map_err(|e| {
-            eprintln!("Failed to fetch latest block hash: {}", e);
-            e
-        })?;
-        let block = fetch_block(&latest_block_hash).await.map_err(|e| {
-            eprintln!("Failed to fetch latest block {}: {}", latest_block_hash, e);
-            e
-        })?;
+        let latest_block_hash = fetch_best_block_hash(rpc_host, rpc_user, rpc_password, rpc_port).await?;
+        let block = fetch_block(&latest_block_hash, rpc_host, rpc_user, rpc_password, rpc_port).await?;
         
         // Check if the block is already stored and marked as active
         let row = client.query_one("SELECT block_hash FROM blocks WHERE block_hash = $1 AND active = TRUE", &[&block.hash]).await;
         
         if row.is_err() {
             // Block is not active or does not exist, handle reorg
-            handle_reorg(client, &block).await.map_err(|e| {
-                eprintln!("Failed to handle reorg for block {}: {}", block.hash, e);
-                e
-            })?;
+            handle_reorg(client, &block, rpc_host, rpc_user, rpc_password, rpc_port).await?;
         }
 
         sleep(Duration::from_secs(10)).await;
     }
 }
 
-async fn handle_reorg(client: &mut Client, new_block: &Block) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_reorg(client: &mut Client, new_block: &Block, rpc_host: &str, rpc_user: &str, rpc_password: &str, rpc_port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let mut block_hash = new_block.hash.clone();
 
     // Deactivate blocks from the current chain until we find the common ancestor
     while client.query_one("SELECT block_hash FROM blocks WHERE block_hash = $1 AND active = TRUE", &[&block_hash]).await.is_err() {
-        let block = fetch_block(&block_hash).await.map_err(|e| {
-            eprintln!("Failed to fetch block {} during reorg: {}", block_hash, e);
-            e
-        })?;
-        client.execute("UPDATE blocks SET active = FALSE WHERE block_hash = $1", &[&block_hash]).await.map_err(|e| {
-            eprintln!("Failed to deactivate block {}: {}", block_hash, e);
-            e
-        })?;
+        let block = fetch_block(&block_hash, rpc_host, rpc_user, rpc_password, rpc_port).await?;
+        client.execute("UPDATE blocks SET active = FALSE WHERE block_hash = $1", &[&block_hash]).await?;
         block_hash = block.previousblockhash.clone().unwrap_or_default();
     }
 
     // Activate blocks from the new chain
-    let mut block_hash = new_block.hash.clone();
+    block_hash = new_block.hash.clone();
     while !block_hash.is_empty() {
-        let block = fetch_block(&block_hash).await.map_err(|e| {
-            eprintln!("Failed to fetch block {} during reorg activation: {}", block_hash, e);
-            e
-        })?;
-        store_block(client, &block, true).await.map_err(|e| {
-            eprintln!("Failed to store block {} during reorg activation: {}", block.hash, e);
-            e
-        })?;
-
-        let mut transactions = Vec::new();
-        let mut inputs = Vec::new();
-        let mut outputs = Vec::new();
-
-        for txid in &block.tx {
-            let tx = fetch_transaction(txid).await.map_err(|e| {
-                eprintln!("Failed to fetch transaction {} during reorg activation: {}", txid, e);
-                e
-            })?;
-            transactions.push(tx.clone());
-            for (index, vin) in tx.vin.iter().enumerate() {
-                inputs.push((tx.txid.clone(), index as i32, vin.txid.clone(), vin.vout, vin.scriptSig.as_ref().map(|s| s.asm.clone()), vin.sequence));
-            }
-            for (index, vout) in tx.vout.iter().enumerate() {
-                outputs.push((tx.txid.clone(), index as i32, vout.value, vout.scriptPubKey.asm.clone()));
-            }
-        }
-
-        let transaction = client.transaction().await.map_err(|e| {
-            eprintln!("Failed to start transaction during reorg activation for block {}: {}", block.hash, e);
-            e
-        })?;
-        store_transactions(&transaction, &transactions).await.map_err(|e| {
-            eprintln!("Failed to store transactions during reorg activation for block {}: {}", block.hash, e);
-            e
-        })?;
-        store_inputs(&transaction, &inputs).await.map_err(|e| {
-            eprintln!("Failed to store inputs during reorg activation for block {}: {}", block.hash, e);
-            e
-        })?;
-        store_outputs(&transaction, &outputs).await.map_err(|e| {
-            eprintln!("Failed to store outputs during reorg activation for block {}: {}", block.hash, e);
-            e
-        })?;
-        transaction.commit().await.map_err(|e| {
-            eprintln!("Failed to commit transaction during reorg activation for block {}: {}", block.hash, e);
-            e
-        })?;
-
+        let block = fetch_block(&block_hash, rpc_host, rpc_user, rpc_password, rpc_port).await?;
+        process_block(client, &block).await?;
         block_hash = block.previousblockhash.clone().unwrap_or_default();
     }
 
