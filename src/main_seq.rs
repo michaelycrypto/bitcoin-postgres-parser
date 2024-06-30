@@ -1,29 +1,30 @@
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
-use tokio_postgres::{NoTls, Client, Config, CopyInSink};
+use tokio_postgres::{NoTls, Client};
 use byteorder::{LittleEndian, ReadBytesExt};
 use sha2::{Sha256, Digest};
 use hex::encode;
 use futures::stream::{self, StreamExt};
-use bb8::Pool;
-use bb8_postgres::PostgresConnectionManager;
-use futures::SinkExt;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connecting to the database...");
-    
-    let config = "host=localhost user=postgres password=postgres dbname=postgres"
-        .parse::<Config>()
-        .unwrap();
-    let manager = PostgresConnectionManager::new(config, NoTls);
-    let pool = Pool::builder().build(manager).await?;
-    
+    let (client, connection) =
+        tokio_postgres::connect("host=localhost user=postgres password=postgres dbname=postgres", NoTls).await?;
+
+    let client = Arc::new(client);
+
     println!("Connected to the database.");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
 
     println!("Setting up the database schema...");
-    setup_database(&pool).await?;
+    setup_database(&client).await?;
     println!("Database schema setup complete.");
 
     let path = "/home/singular/.bitcoin/blocks/";
@@ -31,13 +32,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     stream::iter(paths)
         .for_each_concurrent(None, |entry| {
-            let pool = pool.clone();
+            let client = Arc::clone(&client);
             let path = entry.path().clone();
             async move {
                 if path.file_name().unwrap_or_default().to_str().unwrap().starts_with("blk") &&
                     path.extension().unwrap_or_default() == "dat" {
                     println!("Processing file: {:?}", path);
-                    if let Err(e) = process_file(&pool, path).await {
+                    if let Err(e) = process_file(&client, path).await {
                         eprintln!("Failed to process file: {}", e);
                     }
                 }
@@ -49,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn setup_database(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Result<(), Box<dyn std::error::Error>> {
+async fn setup_database(client: &Arc<Client>) -> Result<(), Box<dyn std::error::Error>> {
     let schema = "
         DROP TABLE IF EXISTS inputs;
         DROP TABLE IF EXISTS outputs;
@@ -97,18 +98,17 @@ async fn setup_database(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Result
         );
     ";
 
-    let conn = pool.get().await?;
-    conn.batch_execute(schema).await?;
+    client.batch_execute(schema).await?;
     Ok(())
 }
 
-async fn process_file(pool: &Pool<PostgresConnectionManager<NoTls>>, path: PathBuf) -> io::Result<()> {
+async fn process_file(client: &Arc<Client>, path: PathBuf) -> io::Result<()> {
     let file = File::open(&path)?;
     let mut reader = BufReader::new(file);
 
     while let Ok(block) = read_block(&mut reader) {
         let start_time = std::time::Instant::now();
-        if let Err(e) = insert_block(pool, &block).await {
+        if let Err(e) = insert_block(client, &block).await {
             eprintln!("Failed to insert block: {}", e);
         } else {
             let duration = start_time.elapsed();
@@ -331,44 +331,70 @@ fn calculate_txid(inputs: &[Input], outputs: &[Output], version: i32, locktime: 
     encode(hasher.finalize().iter().rev().cloned().collect::<Vec<u8>>())
 }
 
-async fn insert_block(pool: &Pool<PostgresConnectionManager<NoTls>>, block: &Block) -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = pool.get().await?;
-    let transaction = conn.transaction().await?;
+async fn insert_block(client: &Arc<Client>, block: &Block) -> Result<(), Box<dyn std::error::Error>> {
+    client
+        .execute(
+            "INSERT INTO blocks (block_hash, height, time, difficulty, merkle_root, nonce, size, version, bits, previous_block, active) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            &[
+                &block.block_hash,
+                &block.height,
+                &block.time,
+                &(block.difficulty as f64),
+                &block.merkle_root,
+                &(block.nonce as f64),
+                &block.size,
+                &block.version,
+                &block.bits,
+                &block.previous_block,
+                &block.active,
+            ],
+        )
+        .await?;
 
-    // Insert block using COPY
-    let mut block_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(transaction.copy_in("COPY blocks (block_hash, height, time, difficulty, merkle_root, nonce, size, version, bits, previous_block, active) FROM STDIN WITH DELIMITER ',' CSV").await?);
-    let block_line = format!("{},{},{},{},{},{},{},{},{},{},{}\n", block.block_hash, block.height, block.time, block.difficulty as f64, block.merkle_root, block.nonce as f64, block.size, block.version, block.bits, block.previous_block, block.active);
-    block_sink.as_mut().send(block_line.into()).await?;
-    block_sink.as_mut().close().await?;
-
-    // Insert transactions using COPY
-    let mut tx_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(transaction.copy_in("COPY transactions (txid, block_hash, size, version, locktime) FROM STDIN WITH DELIMITER ',' CSV").await?);
     for tx in &block.transactions {
-        let tx_line = format!("{},{},{},{},{}\n", tx.txid, block.block_hash, tx.size, tx.version, tx.locktime);
-        tx_sink.as_mut().send(tx_line.into()).await?;
-    }
-    tx_sink.as_mut().close().await?;
+        client
+            .execute(
+                "INSERT INTO transactions (txid, block_hash, size, version, locktime) VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &tx.txid,
+                    &tx.block_hash,
+                    &tx.size,
+                    &tx.version,
+                    &tx.locktime,
+                ],
+            )
+            .await?;
 
-    // Insert inputs using COPY
-    let mut input_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(transaction.copy_in("COPY inputs (txid, input_index, previous_txid, previous_output_index, script_sig, sequence) FROM STDIN WITH DELIMITER ',' CSV").await?);
-    for tx in &block.transactions {
         for input in &tx.inputs {
-            let input_line = format!("{},{},{},{},{},{}\n", tx.txid, input.input_index, input.previous_txid, input.previous_output_index, input.script_sig, input.sequence);
-            input_sink.as_mut().send(input_line.into()).await?;
+            client
+                .execute(
+                    "INSERT INTO inputs (txid, input_index, previous_txid, previous_output_index, script_sig, sequence) VALUES ($1, $2, $3, $4, $5, $6)",
+                    &[
+                        &tx.txid,
+                        &input.input_index,
+                        &input.previous_txid,
+                        &input.previous_output_index,
+                        &input.script_sig,
+                        &input.sequence,
+                    ],
+                )
+                .await?;
         }
-    }
-    input_sink.as_mut().close().await?;
 
-    // Insert outputs using COPY
-    let mut output_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(transaction.copy_in("COPY outputs (txid, output_index, value, script_pub_key) FROM STDIN WITH DELIMITER ',' CSV").await?);
-    for tx in &block.transactions {
         for output in &tx.outputs {
-            let output_line = format!("{},{},{},{}\n", tx.txid, output.output_index, output.value as f64, output.script_pub_key);
-            output_sink.as_mut().send(output_line.into()).await?;
+            client
+                .execute(
+                    "INSERT INTO outputs (txid, output_index, value, script_pub_key) VALUES ($1, $2, $3, $4)",
+                    &[
+                        &tx.txid,
+                        &output.output_index,
+                        &(output.value as f64),
+                        &output.script_pub_key,
+                    ],
+                )
+                .await?;
         }
     }
-    output_sink.as_mut().close().await?;
 
-    transaction.commit().await?;
     Ok(())
 }
