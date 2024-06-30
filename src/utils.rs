@@ -19,7 +19,6 @@ pub fn read_block<R: Read>(reader: &mut R) -> io::Result<Block> {
     let nonce = reader.read_u32::<LittleEndian>()? as i64;
 
     let height = 0;
-    let size = 0;
     let active = true;
 
     let block_hash = calculate_block_hash(version, &previous_block, &merkle_root, time, &bits, nonce);
@@ -29,9 +28,16 @@ pub fn read_block<R: Read>(reader: &mut R) -> io::Result<Block> {
     let mut transactions = Vec::new();
     let tx_count = read_var_int(reader)?;
 
+    let mut transactions_size = 0;
     for _ in 0..tx_count {
-        transactions.push(read_transaction(reader, &block_hash)?);
+        let tx = read_transaction(reader, &block_hash)?;
+        transactions_size += calculate_transaction_size(&tx);
+        transactions.push(tx);
     }
+
+    // Calculate the block header size
+    let block_header_size = 4 + 32 + 32 + 4 + 4 + 4;
+    let size = block_header_size + transactions_size;
 
     Ok(Block {
         block_hash,
@@ -40,7 +46,7 @@ pub fn read_block<R: Read>(reader: &mut R) -> io::Result<Block> {
         difficulty,
         merkle_root,
         nonce,
-        size,
+        size: size as i32,
         version,
         bits,
         previous_block,
@@ -70,16 +76,25 @@ pub fn read_transaction<R: Read>(reader: &mut R, block_hash: &str) -> io::Result
     let locktime = reader.read_u32::<LittleEndian>()?;
     let txid = calculate_txid(&inputs, &outputs, version, locktime as i32);
 
-    Ok(Transaction {
+    let transaction = Transaction {
         txid,
         block_hash: block_hash.to_string(),
-        size: 0,
+        size: 0, // This will be recalculated
         version,
         locktime: locktime as i32,
         inputs,
         outputs,
+    };
+
+    // Calculate the size of the transaction
+    let size = calculate_transaction_size(&transaction);
+
+    Ok(Transaction {
+        size: size as i32,
+        ..transaction
     })
 }
+
 
 pub fn read_input<R: Read>(reader: &mut R, index: i32) -> io::Result<Input> {
     let previous_txid = read_hash(reader)?;
@@ -129,6 +144,27 @@ pub fn read_hash<R: Read>(reader: &mut R) -> io::Result<String> {
     let mut hash = [0; 32];
     reader.read_exact(&mut hash)?;
     Ok(encode(hash.iter().rev().cloned().collect::<Vec<u8>>()))
+}
+
+fn varint_size(value: u64) -> usize {
+    match value {
+        0..=0xFC => 1,
+        0xFD..=0xFFFF => 3,
+        0x10000..=0xFFFFFFFF => 5,
+        _ => 9,
+    }
+}
+
+fn calculate_transaction_size(tx: &Transaction) -> usize {
+    let inputs_size: usize = tx.inputs.iter().map(|input| {
+        32 + 4 + varint_size(input.script_sig.len() as u64) + (input.script_sig.len() / 2) + 4
+    }).sum();
+
+    let outputs_size: usize = tx.outputs.iter().map(|output| {
+        8 + varint_size(output.script_pub_key.len() as u64) + (output.script_pub_key.len() / 2)
+    }).sum();
+
+    4 + varint_size(tx.inputs.len() as u64) + inputs_size + varint_size(tx.outputs.len() as u64) + outputs_size + 4
 }
 
 pub fn calculate_block_hash(
