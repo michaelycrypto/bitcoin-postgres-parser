@@ -45,8 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_database(&pool).await?;
     println!("Database schema setup complete.");
 
-    let paths = std::fs::read_dir(&blocks_path)?
+    // Read the directory and collect entries
+    let mut paths: Vec<_> = std::fs::read_dir(&blocks_path)?
         .collect::<Result<Vec<_>, io::Error>>()?;
+    
+    // Sort the entries alphabetically
+    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
     let (tx, mut rx) = mpsc::channel(100);
     let semaphore = Arc::new(Semaphore::new(1));
