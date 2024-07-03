@@ -59,7 +59,7 @@ pub async fn setup_database(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Re
 }
 
 pub async fn insert_block(pool: &Pool<PostgresConnectionManager<NoTls>>, block: &Block) -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = pool.get().await?;
+    let conn = pool.get().await?;
 
     let mut block_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(conn.copy_in("COPY blocks (block_hash, height, time, difficulty, merkle_root, nonce, size, version, bits, previous_block, active) FROM STDIN WITH DELIMITER ',' CSV").await?);
     let block_line = format!("{},{},{},{},{},{},{},{},{},{},{}\n", block.block_hash, block.height, block.time, block.difficulty as f64, block.merkle_root, block.nonce as f64, block.size, block.version, block.bits, block.previous_block, block.active);
