@@ -58,7 +58,6 @@ A separate task receives blocks from this channel and inserts them into the data
 - **main.rs**: Entry point of the application.
 - **database.rs**: Handles database setup and block insertion logic.
 - **models.rs**: Contains data models such as `Block`.
-- **processing.rs**: Includes functions for processing block files.
 - **utils.rs**: Utility functions used across the application.
 
 ## Environment Variables
