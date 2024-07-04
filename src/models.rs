@@ -1,4 +1,4 @@
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Block {
     pub block_hash: String,
     pub height: i32,
@@ -14,7 +14,7 @@ pub struct Block {
     pub transactions: Vec<Transaction>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Transaction {
     pub txid: String,
     pub block_hash: String,
@@ -25,7 +25,7 @@ pub struct Transaction {
     pub outputs: Vec<Output>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Input {
     pub input_index: i32,
     pub previous_txid: String,
@@ -34,7 +34,7 @@ pub struct Input {
     pub sequence: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Output {
     pub output_index: i32,
     pub value: i64,

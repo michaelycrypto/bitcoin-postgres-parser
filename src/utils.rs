@@ -18,33 +18,22 @@ pub fn read_block<R: Read>(reader: &mut R) -> io::Result<Block> {
     let bits = format!("{:x}", reader.read_u32::<LittleEndian>()?);
     let nonce = reader.read_u32::<LittleEndian>()? as i64;
 
-    let block_hash = calculate_block_hash(version, &previous_block, &merkle_root, time, &bits, nonce);
-    let difficulty = calculate_block_difficulty(&bits).expect("Failed to calculate difficulty");
-
     let tx_count = read_var_int(reader)?;
     let mut transactions = Vec::with_capacity(tx_count.min(1_000_000) as usize); // Limit to prevent overflow
-    let mut transactions_size = 0;
 
     for _ in 0..tx_count {
-        let tx = read_transaction(reader, &block_hash)?;
-
-        if !is_bip30_conflict(&tx.txid, &block_hash) {
-            transactions_size += calculate_transaction_size(&tx);
-            transactions.push(tx);
-        }
+        let tx = read_transaction(reader)?;
+        transactions.push(tx);
     }
 
-    let block_header_size = 4 + 32 + 32 + 4 + 4 + 4;
-    let size = block_header_size + transactions_size;
-
     Ok(Block {
-        block_hash,
+        block_hash: String::new(), // Placeholder, to be calculated later
         height: 0,
         time,
-        difficulty,
+        difficulty: 0.0,
         merkle_root,
         nonce,
-        size: size as i32,
+        size: 0,
         version,
         bits,
         previous_block,
@@ -53,12 +42,7 @@ pub fn read_block<R: Read>(reader: &mut R) -> io::Result<Block> {
     })
 }
 
-fn is_bip30_conflict(txid: &str, block_hash: &str) -> bool {
-    (txid == "ef412cf1f8ff44bbf0bede1ea30a0ce741d625425edbf53883d53f7c682a0548" && block_hash == "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f") ||
-    (txid == "4a4780f0046f0f69d429a32b0307aabaf2fd437685ee18d28274f4cda1e3d40b" && block_hash == "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e")
-}
-
-pub fn read_transaction<R: Read>(reader: &mut R, block_hash: &str) -> io::Result<Transaction> {
+pub fn read_transaction<R: Read>(reader: &mut R) -> io::Result<Transaction> {
     let version = reader.read_i32::<LittleEndian>()?;
     let input_count = read_var_int(reader)?;
 
@@ -74,23 +58,15 @@ pub fn read_transaction<R: Read>(reader: &mut R, block_hash: &str) -> io::Result
     }
 
     let locktime = reader.read_u32::<LittleEndian>()?;
-    let txid = calculate_txid(&inputs, &outputs, version, locktime as i32);
 
-    let transaction = Transaction {
-        txid,
-        block_hash: block_hash.to_string(),
-        size: 0, // This will be recalculated
+    Ok(Transaction {
+        txid: String::new(), // Placeholder, to be calculated later
+        block_hash: String::new(),
+        size: 0, // Placeholder, to be recalculated later
         version,
         locktime: locktime as i32,
         inputs,
         outputs,
-    };
-
-    let size = calculate_transaction_size(&transaction);
-
-    Ok(Transaction {
-        size: size as i32,
-        ..transaction
     })
 }
 
@@ -99,7 +75,7 @@ pub fn read_input<R: Read>(reader: &mut R, index: i32) -> io::Result<Input> {
     let previous_output_index = reader.read_i32::<LittleEndian>()?;
     let script_sig_length = read_var_int(reader)? as usize;
 
-    if script_sig_length > 1_000_000 {
+    if (script_sig_length > 1_000_000) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "scriptSig length too large"));
     }
 
@@ -161,18 +137,6 @@ fn varint_size(value: u64) -> usize {
     }
 }
 
-fn calculate_transaction_size(tx: &Transaction) -> usize {
-    let inputs_size: usize = tx.inputs.iter().map(|input| {
-        32 + 4 + varint_size(input.script_sig.len() as u64) + (input.script_sig.len() / 2) + 4
-    }).sum();
-
-    let outputs_size: usize = tx.outputs.iter().map(|output| {
-        8 + varint_size(output.script_pub_key.len() as u64) + (output.script_pub_key.len() / 2)
-    }).sum();
-
-    4 + varint_size(tx.inputs.len() as u64) + inputs_size + varint_size(tx.outputs.len() as u64) + outputs_size + 4
-}
-
 pub fn calculate_block_hash(
     version: i32,
     previous_block: &str,
@@ -216,26 +180,40 @@ pub fn calculate_block_difficulty(bits: &str) -> Result<f64, Box<dyn Error>> {
     Ok(difficulty_1_target_f64 / current_target_f64)
 }
 
-pub fn calculate_txid(inputs: &[Input], outputs: &[Output], version: i32, locktime: i32) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(&version.to_le_bytes());
+pub fn calculate_tx(tx: &Transaction) -> (String, usize) {
+    // Calculate the size
+    let inputs_size: usize = tx.inputs.iter().map(|input| {
+        32 + 4 + varint_size(input.script_sig.len() as u64) + (input.script_sig.len() / 2) + 4
+    }).sum();
 
-    for input in inputs {
+    let outputs_size: usize = tx.outputs.iter().map(|output| {
+        8 + varint_size(output.script_pub_key.len() as u64) + (output.script_pub_key.len() / 2)
+    }).sum();
+
+    let size = 4 + varint_size(tx.inputs.len() as u64) + inputs_size + varint_size(tx.outputs.len() as u64) + outputs_size + 4;
+
+    // Calculate the txid
+    let mut hasher = Sha256::new();
+    hasher.update(&tx.version.to_le_bytes());
+
+    for input in &tx.inputs {
         hasher.update(&hex::decode(&input.previous_txid).unwrap().iter().rev().cloned().collect::<Vec<u8>>());
         hasher.update(&(input.previous_output_index as u32).to_le_bytes());
         hasher.update(&hex::decode(&input.script_sig).unwrap());
         hasher.update(&(input.sequence as u32).to_le_bytes());
     }
 
-    for output in outputs {
+    for output in &tx.outputs {
         hasher.update(&output.value.to_le_bytes());
         hasher.update(&hex::decode(&output.script_pub_key).unwrap());
     }
 
-    hasher.update(&(locktime as u32).to_le_bytes());
+    hasher.update(&(tx.locktime as u32).to_le_bytes());
 
     let first_hash = hasher.finalize();
     let mut hasher = Sha256::new();
     hasher.update(first_hash);
-    encode(hasher.finalize().iter().rev().cloned().collect::<Vec<u8>>())
+    let txid = encode(hasher.finalize().iter().rev().cloned().collect::<Vec<u8>>());
+
+    (txid, size)
 }
