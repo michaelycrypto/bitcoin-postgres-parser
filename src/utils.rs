@@ -6,6 +6,7 @@ use num_bigint::BigUint;
 use num_traits::{CheckedMul, FromPrimitive, ToPrimitive};
 use crate::models::{Block, Transaction, Input, Output};
 use std::error::Error;
+use time::OffsetDateTime;
 
 pub fn read_block<R: Read>(reader: &mut R) -> io::Result<Block> {
     let _magic = reader.read_u32::<LittleEndian>()?;
@@ -14,7 +15,8 @@ pub fn read_block<R: Read>(reader: &mut R) -> io::Result<Block> {
     let version = reader.read_i32::<LittleEndian>()?;
     let previous_block = read_hash(reader)?;
     let merkle_root = read_hash(reader)?;
-    let time = chrono::NaiveDateTime::from_timestamp(reader.read_u32::<LittleEndian>()? as i64, 0);
+    let time = OffsetDateTime::from_unix_timestamp(reader.read_u32::<LittleEndian>()? as i64)
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let bits = format!("{:x}", reader.read_u32::<LittleEndian>()?);
     let nonce = reader.read_u32::<LittleEndian>()? as i64;
 
@@ -75,7 +77,7 @@ pub fn read_input<R: Read>(reader: &mut R, index: i32) -> io::Result<Input> {
     let previous_output_index = reader.read_i32::<LittleEndian>()?;
     let script_sig_length = read_var_int(reader)? as usize;
 
-    if (script_sig_length > 1_000_000) {
+    if script_sig_length > 1_000_000 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "scriptSig length too large"));
     }
 
@@ -141,7 +143,7 @@ pub fn calculate_block_hash(
     version: i32,
     previous_block: &str,
     merkle_root: &str,
-    time: chrono::NaiveDateTime,
+    time: OffsetDateTime,
     bits: &str,
     nonce: i64,
 ) -> String {
@@ -149,7 +151,7 @@ pub fn calculate_block_hash(
     hasher.update(&version.to_le_bytes());
     hasher.update(&hex::decode(previous_block).unwrap().iter().rev().cloned().collect::<Vec<u8>>());
     hasher.update(&hex::decode(merkle_root).unwrap().iter().rev().cloned().collect::<Vec<u8>>());
-    hasher.update(&(time.timestamp() as u32).to_le_bytes());
+    hasher.update(&(time.unix_timestamp() as u32).to_le_bytes());
     hasher.update(&u32::from_str_radix(bits, 16).unwrap().to_le_bytes());
     hasher.update(&(nonce as u32).to_le_bytes());
     let first_hash = hasher.finalize();

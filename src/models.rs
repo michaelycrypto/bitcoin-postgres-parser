@@ -2,7 +2,7 @@
 pub struct Block {
     pub block_hash: String,
     pub height: i32,
-    pub time: chrono::NaiveDateTime,
+    pub time: time::OffsetDateTime,
     pub difficulty: f64,
     pub merkle_root: String,
     pub nonce: i64,
