@@ -32,7 +32,6 @@ pub async fn process_file(path: PathBuf, raw_tx: mpsc::Sender<Block>) -> io::Res
 
 pub async fn calculate_hashes(mut raw_rx: mpsc::Receiver<Block>, processed_tx: mpsc::Sender<Block>) {
     while let Some(mut block) = raw_rx.recv().await {
-        // Calculate txids concurrently
         let mut transactions_size = 0;
         let _txids: Vec<_> = block.transactions.iter_mut().map(|tx| {
             let (txid, size) = calculate_tx(&tx);
@@ -44,11 +43,7 @@ pub async fn calculate_hashes(mut raw_rx: mpsc::Receiver<Block>, processed_tx: m
 
         let block_header_size = 4 + 32 + 32 + 4 + 4 + 4;
         block.size = block_header_size + transactions_size;
-
-        // Calculate the block difficulty
         block.difficulty = calculate_block_difficulty(&block.bits).expect("Failed to calculate difficulty");
-
-        // Calculate the block hash
         block.block_hash = calculate_block_hash(
             block.version,
             &block.previous_block,
@@ -66,39 +61,29 @@ pub async fn calculate_hashes(mut raw_rx: mpsc::Receiver<Block>, processed_tx: m
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
-    let database_url = env::var("DATABASE_URL")
-        .map_err(|_| "DATABASE_URL must be set in .env file")?;
-    let blocks_path = env::var("BLOCKS_PATH")
-        .map_err(|_| "BLOCKS_PATH must be set in .env file")?;
+    let database_url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set in .env file")?;
+    let blocks_path = env::var("BLOCKS_PATH").map_err(|_| "BLOCKS_PATH must be set in .env file")?;
 
     println!("Connecting to the database...");
-
-    let config = database_url
-        .parse::<tokio_postgres::Config>()
-        .map_err(|_| "Failed to parse DATABASE_URL")?;
+    let config = database_url.parse::<tokio_postgres::Config>().map_err(|_| "Failed to parse DATABASE_URL")?;
     let manager = PostgresConnectionManager::new(config, NoTls);
     let pool = Pool::builder().max_size(200).build(manager).await?;
 
     println!("Connected to the database.");
-
     println!("Setting up the database schema...");
     setup_database(&pool).await?;
     println!("Database schema setup complete.");
 
-    let mut paths: Vec<_> = std::fs::read_dir(&blocks_path)?
-        .collect::<Result<Vec<_>, io::Error>>()?;
-    
+    let mut paths: Vec<_> = std::fs::read_dir(&blocks_path)?.collect::<Result<Vec<_>, io::Error>>()?;
     paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
-    let (raw_tx, mut raw_rx) = mpsc::channel(100);
+    let (raw_tx, raw_rx) = mpsc::channel(100);
     let (processed_tx, mut processed_rx) = mpsc::channel(100);
-    let semaphore = Arc::new(Semaphore::new(32));
+    let semaphore = Arc::new(Semaphore::new(96));
 
-    // Spawn task for calculating hashes
     let hash_handle = task::spawn(calculate_hashes(raw_rx, processed_tx.clone()));
-
     let pool_clone = pool.clone();
-    let handle = task::spawn(async move {
+    let insert_handle = task::spawn(async move {
         let mut block_counter = 0;
         let mut start_time = Instant::now();
 
@@ -136,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(raw_tx);
     drop(processed_tx);
     hash_handle.await?;
-    handle.await?;
+    insert_handle.await?;
 
     println!("All blocks processed.");
     Ok(())
