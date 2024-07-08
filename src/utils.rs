@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::{self, Read, Seek};
 use byteorder::{LittleEndian, ReadBytesExt};
 use sha2::{Sha256, Digest};
 use hex::encode;
@@ -8,7 +8,7 @@ use crate::models::{Block, Transaction, Input, Output};
 use std::error::Error;
 use time::OffsetDateTime;
 
-pub fn read_block<R: Read>(reader: &mut R) -> io::Result<Block> {
+pub fn read_block<R: Read + Seek>(reader: &mut R) -> io::Result<Block> {
     let _magic = reader.read_u32::<LittleEndian>()?;
     let _size = reader.read_u32::<LittleEndian>()?;
 
@@ -16,7 +16,7 @@ pub fn read_block<R: Read>(reader: &mut R) -> io::Result<Block> {
     let previous_block = read_hash(reader)?;
     let merkle_root = read_hash(reader)?;
     let time = OffsetDateTime::from_unix_timestamp(reader.read_u32::<LittleEndian>()? as i64)
-    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let bits = format!("{:x}", reader.read_u32::<LittleEndian>()?);
     let nonce = reader.read_u32::<LittleEndian>()? as i64;
 
@@ -44,19 +44,44 @@ pub fn read_block<R: Read>(reader: &mut R) -> io::Result<Block> {
     })
 }
 
-pub fn read_transaction<R: Read>(reader: &mut R) -> io::Result<Transaction> {
+pub fn read_transaction<R: Read + Seek>(reader: &mut R) -> io::Result<Transaction> {
     let version = reader.read_i32::<LittleEndian>()?;
+
+    // Check for SegWit marker and flag
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let mut witness_data = None;
+    let mut segwit = false;
+
+    let marker = reader.read_u8()?;
+    if marker == 0 {
+        let flag = reader.read_u8()?;
+        if flag != 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid SegWit flag"));
+        }
+        segwit = true;
+    } else {
+        // Not a SegWit transaction, rewind one byte
+        reader.seek(io::SeekFrom::Current(-1))?;
+    }
+
     let input_count = read_var_int(reader)?;
 
-    let mut inputs = Vec::with_capacity(input_count.min(1_000_000) as usize); // Limit to prevent overflow
     for i in 0..input_count {
         inputs.push(read_input(reader, i as i32)?);
     }
 
     let output_count = read_var_int(reader)?;
-    let mut outputs = Vec::with_capacity(output_count.min(1_000_000) as usize); // Limit to prevent overflow
     for i in 0..output_count {
         outputs.push(read_output(reader, i as i32)?);
+    }
+
+    if segwit {
+        let mut witnesses = Vec::with_capacity(input_count as usize);
+        for _ in 0..input_count {
+            witnesses.push(read_witness_data(reader)?);
+        }
+        witness_data = Some(witnesses);
     }
 
     let locktime = reader.read_u32::<LittleEndian>()?;
@@ -69,7 +94,22 @@ pub fn read_transaction<R: Read>(reader: &mut R) -> io::Result<Transaction> {
         locktime: locktime as i32,
         inputs,
         outputs,
+        witness: witness_data,
     })
+}
+
+fn read_witness_data<R: Read>(reader: &mut R) -> io::Result<Vec<Vec<u8>>> {
+    let witness_count = read_var_int(reader)?;
+    let mut witness_fields = Vec::with_capacity(witness_count as usize);
+
+    for _ in 0..witness_count {
+        let length = read_var_int(reader)? as usize;
+        let mut field = vec![0; length];
+        reader.read_exact(&mut field)?;
+        witness_fields.push(field);
+    }
+
+    Ok(witness_fields)
 }
 
 pub fn read_input<R: Read>(reader: &mut R, index: i32) -> io::Result<Input> {
@@ -192,7 +232,15 @@ pub fn calculate_tx(tx: &Transaction) -> (String, usize) {
         8 + varint_size(output.script_pub_key.len() as u64) + (output.script_pub_key.len() / 2)
     }).sum();
 
-    let size = 4 + varint_size(tx.inputs.len() as u64) + inputs_size + varint_size(tx.outputs.len() as u64) + outputs_size + 4;
+    let witness_size: usize = if let Some(witness) = &tx.witness {
+        witness.iter().map(|witnesses| {
+            witnesses.iter().map(|w| varint_size(w.len() as u64) + w.len()).sum::<usize>()
+        }).sum()
+    } else {
+        0
+    };
+
+    let size = 4 + varint_size(tx.inputs.len() as u64) + inputs_size + varint_size(tx.outputs.len() as u64) + outputs_size + 4 + witness_size;
 
     // Calculate the txid
     let mut hasher = Sha256::new();

@@ -23,6 +23,7 @@ pub struct Transaction {
     pub locktime: i32,
     pub inputs: Vec<Input>,
     pub outputs: Vec<Output>,
+    pub witness: Option<Vec<Vec<Vec<u8>>>>, // Optional witness data for SegWit transactions
 }
 
 #[derive(Debug, Clone)]
