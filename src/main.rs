@@ -1,127 +1,89 @@
-use std::fs::File;
-use std::io::{self, BufReader};
 use std::path::PathBuf;
-use tokio::task;
-use tokio::sync::{mpsc, Semaphore};
-use std::sync::Arc;
-use std::time::Instant;
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
-use tokio_postgres::NoTls;
 use dotenv::dotenv;
 use std::env;
+use tokio_postgres::NoTls;
+use std::time::Instant;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use tokio::sync::{Semaphore, OwnedSemaphorePermit};
+use std::sync::Arc;
 
 mod database;
 mod models;
-mod utils;
+mod file_reader;
+mod block_processor;
 
 use database::{setup_database, insert_block};
-use crate::models::Block;
-use crate::utils::{read_block, calculate_tx, calculate_block_hash, calculate_block_difficulty};
-
-pub async fn process_file(path: PathBuf, raw_tx: mpsc::Sender<Block>) -> io::Result<()> {
-    let file = File::open(&path)?;
-    let mut reader = BufReader::new(file);
-
-    while let Ok(block) = read_block(&mut reader) {
-        raw_tx.send(block).await.unwrap();
-    }
-
-    Ok(())
-}
-
-pub async fn calculate_hashes(mut raw_rx: mpsc::Receiver<Block>, processed_tx: mpsc::Sender<Block>) {
-    while let Some(mut block) = raw_rx.recv().await {
-        let mut transactions_size = 0;
-        let _txids: Vec<_> = block.transactions.iter_mut().map(|tx| {
-            let (txid, size) = calculate_tx(&tx);
-            tx.txid = txid.clone();
-            tx.size = size as i32;
-            transactions_size += tx.size;
-            txid
-        }).collect();
-
-        let block_header_size = 4 + 32 + 32 + 4 + 4 + 4;
-        block.size = block_header_size + transactions_size;
-        block.difficulty = calculate_block_difficulty(&block.bits).expect("Failed to calculate difficulty");
-        block.block_hash = calculate_block_hash(
-            block.version,
-            &block.previous_block,
-            &block.merkle_root,
-            block.time,
-            &block.bits,
-            block.nonce,
-        );
-        
-        processed_tx.send(block).await.unwrap();
-    }
-}
+use file_reader::FileReader;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
 
-    let database_url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL must be set in .env file")?;
-    let blocks_path = env::var("BLOCKS_PATH").map_err(|_| "BLOCKS_PATH must be set in .env file")?;
+    let database_url = env::var("DATABASE_URL")?;
+    let blocks_path = env::var("BLOCKS_PATH")?;
+    let verbose = env::var("VERBOSE").unwrap_or_else(|_| "false".to_string()) == "true";
 
     println!("Connecting to the database...");
-    let config = database_url.parse::<tokio_postgres::Config>().map_err(|_| "Failed to parse DATABASE_URL")?;
+    let config = database_url.parse::<tokio_postgres::Config>()?;
     let manager = PostgresConnectionManager::new(config, NoTls);
-    let pool = Pool::builder().max_size(200).build(manager).await?;
+    let pool = Pool::builder().build(manager).await?;
 
     println!("Connected to the database.");
-    println!("Setting up the database schema...");
     setup_database(&pool).await?;
     println!("Database schema setup complete.");
 
-    let mut paths: Vec<_> = std::fs::read_dir(&blocks_path)?.collect::<Result<Vec<_>, io::Error>>()?;
-    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    let file_reader = FileReader::new(PathBuf::from(blocks_path), verbose);
 
-    let (raw_tx, raw_rx) = mpsc::channel(100);
-    let (processed_tx, mut processed_rx) = mpsc::channel(100);
-    let semaphore = Arc::new(Semaphore::new(96));
+    let semaphore = Arc::new(Semaphore::new(5)); // Limit concurrency to 5 tasks
+    let mut insert_futures = FuturesUnordered::new();
 
-    let hash_handle = task::spawn(calculate_hashes(raw_rx, processed_tx.clone()));
-    let pool_clone = pool.clone();
-    let insert_handle = task::spawn(async move {
-        let mut block_counter = 0;
-        let mut start_time = Instant::now();
-
-        while let Some(block) = processed_rx.recv().await {
-            let pool = pool_clone.clone();
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-            task::spawn(async move {
-                if let Err(e) = insert_block(&pool, &block).await {
-                    eprintln!("Failed to insert block {:?}: {}", &block.block_hash, e);
+    for file_index in 0..file_reader.file_paths.len() {
+        match file_reader.read_file(file_index).await {
+            Ok(blocks) => {
+                let start_time = Instant::now();
+                let mut processed_blocks = Vec::new();
+                for block in blocks {
+                    let processed_block = block_processor::process_block(block).await;
+                    processed_blocks.push(processed_block);
                 }
-                drop(permit);
-            });
+                for block in processed_blocks {
+                    let pool = pool.clone();
+                    let semaphore = semaphore.clone();
+                    insert_futures.push(tokio::spawn(async move {
+                        let permit: OwnedSemaphorePermit = semaphore.acquire_owned().await.unwrap();
+                        
+                        if let Err(e) = insert_block(&pool, &block).await {
+                            eprintln!("Failed to insert block: {}", e);
+                        }
+                        
+                        drop(permit); // Release the permit
+                    }));
+                }
 
-            block_counter += 1;
-            if block_counter % 50 == 0 {
-                let duration = start_time.elapsed();
-                println!("Processed 50 blocks in {:?}", duration);
-                start_time = Instant::now();
+                if verbose {
+                    println!("Time taken to process blocks: {:?}", start_time.elapsed());
+                }
+
+                let insert_start_time = Instant::now();
+
+                // Wait for all insertion tasks to complete
+                while let Some(result) = insert_futures.next().await {
+                    if let Err(e) = result {
+                        eprintln!("Task failed: {}", e);
+                    }
+                }
+                println!("Time taken to insert blocks: {:?}", insert_start_time.elapsed());
+                println!("Time taken to process & insert blocks: {:?}", start_time.elapsed());
+
             }
-        }
-    });
-
-    for entry in paths {
-        let raw_tx = raw_tx.clone();
-        let path = entry.path().clone();
-        if path.file_name().unwrap_or_default().to_str().unwrap().starts_with("blk") &&
-            path.extension().unwrap_or_default() == "dat" {
-            println!("Processing file: {:?}", path);
-            if let Err(e) = process_file(path, raw_tx.clone()).await {
-                eprintln!("Failed to process file: {}", e);
+            Err(e) => {
+                eprintln!("Failed to read file at index {}: {}", file_index, e);
             }
         }
     }
-
-    drop(raw_tx);
-    drop(processed_tx);
-    hash_handle.await?;
-    insert_handle.await?;
 
     println!("All blocks processed.");
     Ok(())
