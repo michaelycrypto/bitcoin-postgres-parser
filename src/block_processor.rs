@@ -1,7 +1,8 @@
-use crate::models::{Block, Transaction};
-use sha2::{Sha256, Digest};
 use hex::encode;
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
+
+use crate::models::{Block, Transaction};
 
 pub async fn process_block(mut block: Block) -> Block {
     let transactions_size: i32 = block.transactions.par_iter_mut().map(|tx| {

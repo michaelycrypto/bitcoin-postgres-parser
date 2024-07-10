@@ -1,9 +1,10 @@
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
-use tokio_postgres::NoTls;
-use crate::models::Block;
 use futures::SinkExt;
 use tokio_postgres::CopyInSink;
+use tokio_postgres::NoTls;
+
+use crate::models::Block;
 
 pub async fn setup_database(pool: &Pool<PostgresConnectionManager<NoTls>>) -> Result<(), Box<dyn std::error::Error>> {
     let schema = "

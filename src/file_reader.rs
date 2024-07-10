@@ -1,13 +1,13 @@
+use byteorder::{LittleEndian, ReadBytesExt};
+use hex::encode;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
-use byteorder::{LittleEndian, ReadBytesExt};
-use hex::encode;
-use crate::models::{Block, Transaction, Input, Output};
+use std::time::Instant;
 use time::OffsetDateTime;
 use tokio::task::spawn_blocking;
-use rayon::prelude::*;
-use std::time::Instant;
+
+use crate::models::{Block, Transaction, Input, Output};
 
 pub struct FileReader {
     path: PathBuf,

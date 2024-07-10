@@ -1,22 +1,22 @@
-use std::path::PathBuf;
 use bb8::Pool;
 use bb8_postgres::PostgresConnectionManager;
+use chrono::Local;
 use dotenv::dotenv;
-use std::env;
-use tokio_postgres::NoTls;
-use std::time::{Instant, Duration};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use tokio::sync::Semaphore;
+use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::time::interval;
-use chrono::Local;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
+use tokio::time::interval;
+use tokio_postgres::NoTls;
 
-mod database;
-mod models;
-mod file_reader;
 mod block_processor;
+mod database;
+mod file_reader;
+mod models;
 
 use database::{setup_database, insert_block};
 use file_reader::FileReader;
