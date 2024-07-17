@@ -65,9 +65,10 @@ fn is_bip30_conflict(txid: &str) -> bool {
 }
 
 pub async fn insert_block(pool: &Pool<PostgresConnectionManager<NoTls>>, block: &Block) -> Result<(), Box<dyn std::error::Error>> {
-    let conn = pool.get().await?;
+    let mut conn = pool.get().await?;
+    let transaction = conn.build_transaction().start().await?;
 
-    let mut block_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(conn.copy_in("COPY blocks (block_hash, height, time, difficulty, merkle_root, nonce, size, version, bits, previous_block, active) FROM STDIN WITH DELIMITER ',' CSV").await?);
+    let mut block_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(transaction.copy_in("COPY blocks (block_hash, height, time, difficulty, merkle_root, nonce, size, version, bits, previous_block, active) FROM STDIN WITH DELIMITER ',' CSV").await?);
     let block_line = format!("{},{},{},{},{},{},{},{},{},{},{}\n", block.block_hash, block.height, block.time, block.difficulty as f64, block.merkle_root, block.nonce as f64, block.size, block.version, block.bits, block.previous_block, block.active);
     block_sink.as_mut().send(block_line.into()).await?;
     block_sink.as_mut().close().await?;
@@ -96,25 +97,27 @@ pub async fn insert_block(pool: &Pool<PostgresConnectionManager<NoTls>>, block: 
     }
 
     // Process transactions
-    let mut tx_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(conn.copy_in("COPY transactions (txid, block_hash, size, version, locktime) FROM STDIN WITH DELIMITER ',' CSV").await?);
+    let mut tx_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(transaction.copy_in("COPY transactions (txid, block_hash, size, version, locktime) FROM STDIN WITH DELIMITER ',' CSV").await?);
     for line in tx_lines {
         tx_sink.as_mut().send(line.into()).await?;
     }
     tx_sink.as_mut().close().await?;
 
     // Process inputs
-    let mut input_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(conn.copy_in("COPY inputs (txid, input_index, previous_txid, previous_output_index, script_sig, sequence) FROM STDIN WITH DELIMITER ',' CSV").await?);
+    let mut input_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(transaction.copy_in("COPY inputs (txid, input_index, previous_txid, previous_output_index, script_sig, sequence) FROM STDIN WITH DELIMITER ',' CSV").await?);
     for line in input_lines {
         input_sink.as_mut().send(line.into()).await?;
     }
     input_sink.as_mut().close().await?;
 
     // Process outputs
-    let mut output_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(conn.copy_in("COPY outputs (txid, output_index, value, script_pub_key) FROM STDIN WITH DELIMITER ',' CSV").await?);
+    let mut output_sink: std::pin::Pin<Box<CopyInSink<bytes::Bytes>>> = Box::pin(transaction.copy_in("COPY outputs (txid, output_index, value, script_pub_key) FROM STDIN WITH DELIMITER ',' CSV").await?);
     for line in output_lines {
         output_sink.as_mut().send(line.into()).await?;
     }
     output_sink.as_mut().close().await?;
+
+    transaction.commit().await?;
 
     Ok(())
 }
