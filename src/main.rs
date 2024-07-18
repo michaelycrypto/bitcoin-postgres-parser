@@ -1,24 +1,19 @@
-use bb8::Pool;
-use bb8_postgres::PostgresConnectionManager;
 use chrono::Local;
 use dotenv::dotenv;
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
 use tokio::time::interval;
-use tokio_postgres::NoTls;
+use tokio_postgres::{Config, NoTls};
 
 mod block_processor;
 mod database;
 mod file_reader;
 mod models;
 
-use database::{setup_database, insert_block};
+use database::Database;
 use file_reader::FileReader;
 
 #[tokio::main]
@@ -30,12 +25,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let verbose = env::var("VERBOSE").unwrap_or_else(|_| "false".to_string()) == "true";
 
     println!("Connecting to the database...");
-    let config = database_url.parse::<tokio_postgres::Config>()?;
-    let manager = PostgresConnectionManager::new(config, NoTls);
-    let pool = Pool::builder().max_size(100).build(manager).await?;
+    let config = database_url.parse::<Config>()?;
+    let (client, connection) = config.connect(NoTls).await?;
 
-    println!("Connected to the database.");
-    setup_database(&pool).await?;
+    // Spawn the connection to handle communication with the database
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("Connection error: {}", e);
+        }
+    });
+
+    let mut database = Database::new(client);
+    database.setup_schema().await?;
     println!("Database schema setup complete.");
 
     let file_reader = FileReader::new(PathBuf::from(blocks_path), verbose);
@@ -50,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_txs_clone = Arc::clone(&total_txs);
     let total_files_read_clone = Arc::clone(&total_files_read);
     tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(3));
+        let mut interval = interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
 
@@ -72,48 +73,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Initialize semaphore with 10 permits
-    let semaphore = Arc::new(Semaphore::new(10));
-
     for file_index in 0..file_reader.file_paths.len() {
         match file_reader.read_file(file_index).await {
             Ok(blocks) => {
-                
-
                 let start_time = Instant::now();
                 let mut processed_blocks = Vec::new();
 
                 for block in blocks {
                     total_txs.fetch_add(block.transactions.len(), Ordering::Relaxed);
                     total_blocks.fetch_add(1, Ordering::Relaxed);
-
                     let processed_block = block_processor::process_block(block).await;
                     processed_blocks.push(processed_block);
                 }
-
-                total_files_read.fetch_add(1, Ordering::Relaxed);
 
                 if verbose {
                     println!("Time taken to process blocks: {:?}", start_time.elapsed());
                 }
 
-                let insert_futures = FuturesUnordered::new();
-                for block in processed_blocks.iter() {
-                    let pool = pool.clone();
-                    let block = block.clone();
-                    let semaphore = semaphore.clone();
-
-                    insert_futures.push(tokio::task::spawn(async move {
-                        let _permit = semaphore.acquire().await.unwrap();
-
-                        if let Err(e) = insert_block(&pool, &block).await {
-                            eprintln!("Failed to insert block: {}", e);
-                        }
-                    }));
+                if let Err(e) = database.insert_blocks(&processed_blocks).await {
+                    eprintln!("Failed to insert blocks: {}", e);
                 }
-
-                insert_futures.collect::<Vec<_>>().await;
-
+                
+                total_files_read.fetch_add(1, Ordering::Relaxed);
+                
                 if verbose {
                     println!("Done in {:?}", start_time.elapsed());
                 }

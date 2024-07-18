@@ -4,8 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bb8 = "0.8.5"
-bb8-postgres = "0.8.1"
 byteorder = "1.4"
 bytes = "1.6.0"
 chrono = { version = "0.4", features = ["serde"] }
