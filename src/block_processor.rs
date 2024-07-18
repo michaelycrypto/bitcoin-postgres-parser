@@ -19,22 +19,22 @@ pub async fn process_block(mut block: Block) -> Block {
     block
 }
 
-pub fn calculate_block_hash(block: &Block) -> String {
+pub fn calculate_block_hash(block: &Block) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(&block.version.to_le_bytes());
-    hasher.update(&hex::decode(&block.previous_block).unwrap().iter().rev().cloned().collect::<Vec<u8>>());
-    hasher.update(&hex::decode(&block.merkle_root).unwrap().iter().rev().cloned().collect::<Vec<u8>>());
+    hasher.update(&block.previous_block.iter().rev().cloned().collect::<Vec<u8>>());
+    hasher.update(&block.merkle_root.iter().rev().cloned().collect::<Vec<u8>>());
     hasher.update(&(block.time.unix_timestamp() as u32).to_le_bytes());
-    hasher.update(&u32::from_str_radix(&block.bits, 16).unwrap().to_le_bytes());
+    hasher.update(&block.bits);
     hasher.update(&(block.nonce as u32).to_le_bytes());
     let first_hash = hasher.finalize();
 
     let mut hasher = Sha256::new();
     hasher.update(first_hash);
-    encode(hasher.finalize().iter().rev().cloned().collect::<Vec<u8>>())
+    hasher.finalize().iter().rev().cloned().collect::<Vec<u8>>()
 }
 
-pub fn calculate_tx(tx: &Transaction) -> (String, usize) {
+pub fn calculate_tx(tx: &Transaction) -> (Vec<u8>, usize) {
     let inputs_size: usize = tx.inputs.iter().map(|input| {
         32 + 4 + varint_size(input.script_sig.len() as u64) + (input.script_sig.len() / 2) + 4
     }).sum();
@@ -57,7 +57,7 @@ pub fn calculate_tx(tx: &Transaction) -> (String, usize) {
     hasher.update(&tx.version.to_le_bytes());
 
     for input in &tx.inputs {
-        hasher.update(&hex::decode(&input.previous_txid).unwrap().iter().rev().cloned().collect::<Vec<u8>>());
+        hasher.update(&input.previous_txid.iter().rev().cloned().collect::<Vec<u8>>());
         hasher.update(&(input.previous_output_index as u32).to_le_bytes());
         hasher.update(&hex::decode(&input.script_sig).unwrap());
         hasher.update(&(input.sequence as u32).to_le_bytes());
@@ -73,7 +73,7 @@ pub fn calculate_tx(tx: &Transaction) -> (String, usize) {
     let first_hash = hasher.finalize();
     let mut hasher = Sha256::new();
     hasher.update(first_hash);
-    let txid = encode(hasher.finalize().iter().rev().cloned().collect::<Vec<u8>>());
+    let txid = hasher.finalize().iter().rev().cloned().collect::<Vec<u8>>();
 
     (txid, size)
 }

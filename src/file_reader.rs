@@ -90,7 +90,7 @@ impl FileReader {
         let merkle_root = self.read_hash(reader)?;
         let time = OffsetDateTime::from_unix_timestamp(reader.read_u32::<LittleEndian>()? as i64)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let bits = format!("{:x}", reader.read_u32::<LittleEndian>()?);
+        let bits = reader.read_u32::<LittleEndian>()?.to_le_bytes().to_vec();
         let nonce = reader.read_u32::<LittleEndian>()? as i64;
 
         let tx_count = self.read_var_int(reader)?;
@@ -102,13 +102,14 @@ impl FileReader {
         }
 
         Ok(Block {
-            block_hash: String::new(), // Placeholder, to be calculated later
-            height: 0,
+            id: 0, // Placeholder, should be assigned later
+            block_hash: Vec::new(), // Placeholder, to be calculated later
+            height: 0, // Placeholder, to be assigned later
             time,
-            difficulty: 0.0,
+            difficulty: 0.0, // Placeholder, to be calculated later
             merkle_root,
             nonce,
-            size: 0,
+            size: 0, // Placeholder, to be calculated later
             version,
             bits,
             previous_block,
@@ -157,8 +158,9 @@ impl FileReader {
         let locktime = reader.read_u32::<LittleEndian>()?;
 
         Ok(Transaction {
-            txid: String::new(), // Placeholder, to be calculated later
-            block_hash: String::new(),
+            id: 0, // Placeholder, should be assigned later
+            txid: Vec::new(), // Placeholder, to be calculated later
+            block_hash: Vec::new(), // Placeholder, to be assigned later
             size: 0, // Placeholder, to be recalculated later
             version,
             locktime: locktime as i32,
@@ -196,6 +198,8 @@ impl FileReader {
         let sequence = reader.read_u32::<LittleEndian>()? as i64;
 
         Ok(Input {
+            id: 0, // Placeholder, should be assigned later
+            txid: Vec::new(), // Placeholder, to be assigned later
             input_index: index,
             previous_txid,
             previous_output_index,
@@ -216,6 +220,8 @@ impl FileReader {
         reader.read_exact(&mut script_pub_key)?;
 
         Ok(Output {
+            id: 0, // Placeholder, should be assigned later
+            txid: Vec::new(), // Placeholder, to be assigned later
             output_index: index,
             value,
             script_pub_key: encode(script_pub_key),
@@ -234,9 +240,9 @@ impl FileReader {
         }
     }
 
-    fn read_hash<R: Read + Seek + Send + 'static>(&self, reader: &mut R) -> io::Result<String> {
+    fn read_hash<R: Read + Seek + Send + 'static>(&self, reader: &mut R) -> io::Result<Vec<u8>> {
         let mut hash = [0; 32];
         reader.read_exact(&mut hash)?;
-        Ok(encode(hash.iter().rev().cloned().collect::<Vec<u8>>()))
+        Ok(hash.to_vec())
     }
 }
