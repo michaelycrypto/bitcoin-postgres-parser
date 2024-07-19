@@ -9,7 +9,7 @@ pub struct Block {
     pub nonce: i64,
     pub size: i32,
     pub version: i32,
-    pub bits: Vec<u8>,
+    pub bits: i32,
     pub previous_block: Vec<u8>,
     pub active: bool,
     pub transactions: Vec<Transaction>,

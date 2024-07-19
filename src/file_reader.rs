@@ -1,3 +1,5 @@
+// src/file_reader.rs
+
 use byteorder::{LittleEndian, ReadBytesExt};
 use hex::encode;
 use std::fs::File;
@@ -90,7 +92,7 @@ impl FileReader {
         let merkle_root = self.read_hash(reader)?;
         let time = OffsetDateTime::from_unix_timestamp(reader.read_u32::<LittleEndian>()? as i64)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let bits = reader.read_u32::<LittleEndian>()?.to_le_bytes().to_vec();
+        let bits = reader.read_i32::<LittleEndian>()?;
         let nonce = reader.read_u32::<LittleEndian>()? as i64;
 
         let tx_count = self.read_var_int(reader)?;
@@ -186,7 +188,7 @@ impl FileReader {
 
     fn read_input<R: Read + Seek + Send + 'static>(&self, reader: &mut R, index: i32) -> io::Result<Input> {
         let previous_txid = self.read_hash(reader)?;
-        let previous_output_index = reader.read_i32::<LittleEndian>()?;
+        let previous_output_index = reader.read_u32::<LittleEndian>()? as i32;
         let script_sig_length = self.read_var_int(reader)? as usize;
 
         if script_sig_length > 1_000_000 {

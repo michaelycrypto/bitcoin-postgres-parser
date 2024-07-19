@@ -1,7 +1,6 @@
 use hex::encode;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-
 use crate::models::{Block, Transaction};
 
 pub async fn process_block(mut block: Block) -> Block {
@@ -25,13 +24,15 @@ pub fn calculate_block_hash(block: &Block) -> Vec<u8> {
     hasher.update(&block.previous_block.iter().rev().cloned().collect::<Vec<u8>>());
     hasher.update(&block.merkle_root.iter().rev().cloned().collect::<Vec<u8>>());
     hasher.update(&(block.time.unix_timestamp() as u32).to_le_bytes());
-    hasher.update(&block.bits);
+    hasher.update(&(block.bits as u32).to_le_bytes());
     hasher.update(&(block.nonce as u32).to_le_bytes());
     let first_hash = hasher.finalize();
 
     let mut hasher = Sha256::new();
     hasher.update(first_hash);
-    hasher.finalize().iter().rev().cloned().collect::<Vec<u8>>()
+    let second_hash = hasher.finalize();
+
+    second_hash.iter().rev().cloned().collect::<Vec<u8>>()
 }
 
 pub fn calculate_tx(tx: &Transaction) -> (Vec<u8>, usize) {

@@ -34,7 +34,7 @@ impl Database {
             DROP TABLE IF EXISTS blocks;
 
             CREATE TABLE IF NOT EXISTS blocks (
-                id INT PRIMARY KEY,
+                id INT NOT NULL,
                 block_hash BYTEA,
                 height INT,
                 time TIMESTAMP,
@@ -43,13 +43,13 @@ impl Database {
                 nonce DOUBLE PRECISION,
                 size INT,
                 version INT,
-                bits BYTEA,
+                bits INT,
                 previous_block BYTEA,
                 active BOOLEAN
             );
 
             CREATE TABLE IF NOT EXISTS transactions (
-                id INT PRIMARY KEY,
+                id BIGINT NOT NULL,
                 txid BYTEA,
                 block_hash BYTEA,
                 size INT,
@@ -58,7 +58,7 @@ impl Database {
             );
 
             CREATE TABLE IF NOT EXISTS inputs (
-                id INT PRIMARY KEY,
+                id BIGINT NOT NULL,
                 txid BYTEA,
                 input_index INT,
                 previous_txid BYTEA,
@@ -68,7 +68,7 @@ impl Database {
             );
 
             CREATE TABLE IF NOT EXISTS outputs (
-                id INT PRIMARY KEY,
+                id BIGINT NOT NULL,
                 txid BYTEA,
                 output_index INT,
                 value DOUBLE PRECISION,
@@ -76,9 +76,9 @@ impl Database {
             );
 
             CREATE TABLE IF NOT EXISTS block_transactions (
-                id INT PRIMARY KEY,
+                id BIGINT NOT NULL,
                 block_id INT,
-                transaction_id INT
+                transaction_id BIGINT
             );
         ";
 
@@ -96,11 +96,12 @@ impl Database {
         let mut block_tx_lines = Vec::new();
 
         for block in blocks {
+
             let block_line = format!(
                 "{}, \\x{}, {}, '{}', {}, \\x{}, {}, {}, {}, \\x{}, \\x{}, {}\n",
                 self.block_id, encode(&block.block_hash), block.height, block.time, block.difficulty as f64,
                 encode(&block.merkle_root), block.nonce as f64, block.size, block.version,
-                encode(&block.bits), encode(&block.previous_block), block.active
+                block.bits, encode(&block.previous_block), block.active
             );
             block_lines.push(block_line);
 
